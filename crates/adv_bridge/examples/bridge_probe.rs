@@ -9,7 +9,16 @@
 //! exercises `ApplyDelta` (recolour and move `/Level/Crate`) and `SetViewport`
 //! (640x360) and checks that later frames reflect both.
 
-use std::{collections::HashMap, error::Error, path::PathBuf, time::Duration};
+use std::{
+    collections::{BTreeMap, HashMap},
+    error::Error,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Mutex,
+    },
+    time::{Duration, Instant},
+};
 
 use adv_bridge::proto::{
     bridge_client::BridgeClient, engine_event::Kind as EventKind, input_event::Kind as InputKind,
@@ -36,6 +45,14 @@ async fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
     if let Some(stem) = args.interact.as_deref() {
         let passed = run_interact(stem).await?;
+        std::process::exit(if passed { 0 } else { 1 });
+    }
+    if args.shm {
+        let passed = run_shm().await?;
+        std::process::exit(if passed { 0 } else { 1 });
+    }
+    if let Some(secs) = args.bench {
+        let passed = run_bench(secs).await?;
         std::process::exit(if passed { 0 } else { 1 });
     }
     if args.load_select {
@@ -99,7 +116,10 @@ async fn main() -> Result<(), Box<dyn Error>> {
     println!("load_stage: ok={} {}", ack.ok, ack.message);
 
     let mut frames = client
-        .stream_frames(StreamFramesRequest { max_fps: 10 })
+        .stream_frames(StreamFramesRequest {
+            max_fps: 10,
+            ..Default::default()
+        })
         .await?
         .into_inner();
 
@@ -130,6 +150,7 @@ async fn main() -> Result<(), Box<dyn Error>> {
                 base_color: Some(rgba([1.0, 0.0, 0.0])),
                 removed: false,
             }],
+            ..Default::default()
         })
         .await?
         .into_inner();
@@ -184,6 +205,10 @@ struct Args {
     resize_before_load: bool,
     /// `--load-select`: LoadStage then SetSelection with no pause, 20 times.
     load_select: bool,
+    /// `--shm`: ring pixels vs inline pixels, and the torn-read stress.
+    shm: bool,
+    /// `--bench <secs>`: inline vs ring frames, throughput and edit latency.
+    bench: Option<u64>,
 }
 
 /// Parses `--save <path>` and `--interact <stem>`.
@@ -195,6 +220,8 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
         resize: Vec::new(),
         resize_before_load: false,
         load_select: false,
+        shm: false,
+        bench: None,
     };
     while let Some(arg) = args.next() {
         match arg.as_str() {
@@ -211,6 +238,11 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
             }
             "--resize-before-load" => parsed.resize_before_load = true,
             "--load-select" => parsed.load_select = true,
+            "--shm" => parsed.shm = true,
+            "--bench" => {
+                let secs = args.next().ok_or("--bench needs seconds")?;
+                parsed.bench = Some(secs.parse()?);
+            }
             other => return Err(format!("unknown argument {other:?}").into()),
         }
     }
@@ -484,7 +516,10 @@ async fn run_interact(stem: &std::path::Path) -> Result<bool, Box<dyn Error>> {
     checks.check("load_stage accepted", ack.ok, &ack.message);
 
     let mut frames = client
-        .stream_frames(StreamFramesRequest { max_fps: 10 })
+        .stream_frames(StreamFramesRequest {
+            max_fps: 10,
+            ..Default::default()
+        })
         .await?
         .into_inner();
 
@@ -886,7 +921,10 @@ async fn run_resize(
     println!("load_stage: ok={} {}", ack.ok, ack.message);
 
     let mut frames = client
-        .stream_frames(StreamFramesRequest { max_fps: 10 })
+        .stream_frames(StreamFramesRequest {
+            max_fps: 10,
+            ..Default::default()
+        })
         .await?
         .into_inner();
     let started = tokio::time::Instant::now();
@@ -1074,4 +1112,539 @@ async fn run_load_select() -> Result<bool, Box<dyn Error>> {
 fn endpoint() -> String {
     let addr = std::env::var("ADV_PROBE_ADDR").unwrap_or_else(|_| "127.0.0.1:50051".into());
     format!("http://{addr}")
+}
+
+// ---- --shm: ring pixels match inline pixels, and torn reads are detected -----
+
+/// Ring layout constants, mirrored from proto/adventure.proto ("Frame ring").
+const RING_HEADER_BYTES: usize = 64;
+const RING_SLOT_HEADER_BYTES: usize = 32;
+const RING_LATEST_OFFSET: usize = 24;
+/// Frame rate of the torn-read stress.
+const STRESS_FPS: u32 = 60;
+const STRESS_SECS: u64 = 5;
+
+/// Read-only view of the engine's frame ring, read with the seqlock protocol.
+struct RingView {
+    map: memmap2::Mmap,
+    slots: u32,
+    slot_bytes: u64,
+}
+
+/// Outcome of reading one ring slot.
+enum SlotRead {
+    /// The copy is consistent: `seq_begin == seq_end == sequence` before and after.
+    Ok(Vec<u8>),
+    /// The slot was overwritten while it was being copied.
+    Torn,
+    /// The slot did not hold the requested sequence (already overwritten or not yet written).
+    Stale,
+}
+
+impl RingView {
+    fn open(hello: &adv_bridge::proto::HelloReply) -> Result<Self, Box<dyn Error>> {
+        if hello.frame_ring_path.is_empty() {
+            return Err("engine reports no frame ring".into());
+        }
+        let file = std::fs::File::open(&hello.frame_ring_path)?;
+        // SAFETY: the engine owns this file and only ever writes it through the seqlock;
+        // the probe maps it read-only and validates every copy.
+        let map = unsafe { memmap2::Mmap::map(&file)? };
+        Ok(Self {
+            map,
+            slots: hello.frame_ring_slots,
+            slot_bytes: hello.frame_ring_slot_bytes,
+        })
+    }
+
+    fn slot_offset(&self, sequence: u64) -> usize {
+        let slot = (sequence % u64::from(self.slots)) as usize;
+        RING_HEADER_BYTES + slot * (RING_SLOT_HEADER_BYTES + self.slot_bytes as usize)
+    }
+
+    /// Atomic view of the 8 bytes at `offset`. The engine lays these out 8-aligned.
+    fn atomic(&self, offset: usize) -> &AtomicU64 {
+        debug_assert_eq!(offset % 8, 0);
+        // SAFETY: offset is inside the mapping and 8-aligned (page-aligned base, slot
+        // capacities are multiples of 64), and AtomicU64 has the layout of u64.
+        unsafe { &*self.map.as_ptr().add(offset).cast::<AtomicU64>() }
+    }
+
+    /// The sequence of the most recently completed frame (0 = none yet).
+    fn latest(&self) -> u64 {
+        self.atomic(RING_LATEST_OFFSET).load(Ordering::Acquire)
+    }
+
+    /// Reads frame `sequence` (`width` x `height`): check the header, copy the
+    /// payload, fence, check the header again.
+    fn read(&self, sequence: u64, width: u32, height: u32) -> SlotRead {
+        let len = u64::from(width) * u64::from(height) * 4;
+        if len > self.slot_bytes {
+            return SlotRead::Stale;
+        }
+        let base = self.slot_offset(sequence);
+        if self.atomic(base).load(Ordering::Acquire) != sequence
+            || self.atomic(base + 8).load(Ordering::Acquire) != sequence
+        {
+            return SlotRead::Stale;
+        }
+        let mut pixels = vec![0_u8; len as usize];
+        // SAFETY: base + 32 + len lies inside the slot, which lies inside the mapping
+        // (checked by `len <= slot_bytes`). Racing writes are possible by design and
+        // are caught by the header re-check below, the usual seqlock reader pattern.
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                self.map.as_ptr().add(base + RING_SLOT_HEADER_BYTES),
+                pixels.as_mut_ptr(),
+                pixels.len(),
+            );
+        }
+        std::sync::atomic::fence(Ordering::Acquire);
+        let begin = self.atomic(base).load(Ordering::Relaxed);
+        let end = self.atomic(base + 8).load(Ordering::Relaxed);
+        if begin == sequence && end == sequence {
+            SlotRead::Ok(pixels)
+        } else {
+            SlotRead::Torn
+        }
+    }
+}
+
+/// Which slot the torn-read stress reads.
+#[derive(Clone, Copy)]
+enum StressTarget {
+    /// The newest completed frame: the writer never reuses it during the read.
+    Latest,
+    /// The oldest frame still in the ring: the writer overwrites it on its next frame.
+    Oldest,
+}
+
+/// Reads the ring at `STRESS_FPS` for `secs` seconds. Returns (ok, torn, stale).
+async fn stress_ring(
+    ring: &RingView,
+    width: u32,
+    height: u32,
+    target: StressTarget,
+    secs: u64,
+) -> (u64, u64, u64) {
+    let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(STRESS_FPS)));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(secs);
+    let (mut ok, mut torn, mut stale) = (0_u64, 0_u64, 0_u64);
+    while tokio::time::Instant::now() < deadline {
+        tick.tick().await;
+        let latest = ring.latest();
+        if latest == 0 {
+            continue;
+        }
+        let sequence = match target {
+            StressTarget::Latest => latest,
+            StressTarget::Oldest => latest.saturating_sub(u64::from(ring.slots) - 1).max(1),
+        };
+        match ring.read(sequence, width, height) {
+            SlotRead::Ok(_) => ok += 1,
+            SlotRead::Torn => torn += 1,
+            SlotRead::Stale => stale += 1,
+        }
+    }
+    (ok, torn, stale)
+}
+
+/// Checks ring pixels against inline pixels for the same static scene, then stresses the ring.
+async fn run_shm() -> Result<bool, Box<dyn Error>> {
+    let mut client = Client::connect(endpoint()).await?;
+    let hello = client
+        .hello(HelloRequest {
+            editor_version: "bridge_probe --shm".into(),
+        })
+        .await?
+        .into_inner();
+    println!(
+        "hello: ring={:?} slots={} slot_bytes={}",
+        hello.frame_ring_path, hello.frame_ring_slots, hello.frame_ring_slot_bytes
+    );
+    let ring = RingView::open(&hello)?;
+
+    let ack = client
+        .load_stage(LoadStageRequest {
+            entities: demo_scene(),
+        })
+        .await?
+        .into_inner();
+    println!("load_stage: ok={} {}", ack.ok, ack.message);
+
+    let mut inline = client
+        .stream_frames(StreamFramesRequest {
+            max_fps: 10,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    let mut shared = client
+        .stream_frames(StreamFramesRequest {
+            max_fps: 10,
+            prefer_shared_memory: true,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+
+    // The scene keeps changing for the first seconds after LoadStage (pipelines and
+    // lighting settle), so compare only once two consecutive ring frames are identical.
+    let (width, height) = (hello.viewport_width, hello.viewport_height);
+    let mut previous: Option<Vec<u8>> = None;
+    let mut settled_at = None;
+    for _ in 0..400 {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        let latest = ring.latest();
+        if latest == 0 {
+            continue;
+        }
+        if let SlotRead::Ok(pixels) = ring.read(latest, width, height) {
+            let frame = adv_bridge::proto::Frame {
+                rgba8: pixels.clone(),
+                ..Default::default()
+            };
+            if previous.as_ref() == Some(&pixels) && !Stats::of(&frame).is_flat() {
+                settled_at = Some(latest);
+                break;
+            }
+            previous = Some(pixels);
+        }
+    }
+    println!(
+        "scene settled: {}",
+        settled_at.map_or("not within 20 s".to_owned(), |seq| format!(
+            "identical frames from seq {seq}"
+        ))
+    );
+
+    let inline_frame = wait_frame(&mut inline, WAIT, |f| {
+        !Stats::of(f).is_flat() && settled_at.is_none_or(|seq| f.sequence > seq)
+    })
+    .await
+    .ok_or("inline frames never rendered the scene")?;
+    // Read each slot as soon as its frame arrives: the engine reuses a slot after
+    // `slots` frames, so a late read is stale. An editor drops such frames, and so
+    // does this check (counted as attempts).
+    let mut attempts = 0_u64;
+    let mut captured: Option<Vec<u8>> = None;
+    let ring_frame = wait_frame(&mut shared, WAIT, |f| {
+        if !f.in_ring || settled_at.is_some_and(|seq| f.sequence <= seq) {
+            return false;
+        }
+        attempts += 1;
+        match ring.read(f.sequence, f.width, f.height) {
+            SlotRead::Ok(pixels) => {
+                captured = Some(pixels);
+                true
+            }
+            SlotRead::Torn | SlotRead::Stale => false,
+        }
+    })
+    .await
+    .ok_or("no in-ring frame could be read consistently")?;
+    println!(
+        "in-ring frames read before a consistent one: {}",
+        attempts - 1
+    );
+    let (width, height) = (ring_frame.width, ring_frame.height);
+    let mut checks = Checks::default();
+    checks.check(
+        "ring frame has no inline pixels",
+        ring_frame.rgba8.is_empty(),
+        format!("{} inline bytes", ring_frame.rgba8.len()),
+    );
+
+    let from_ring = match captured {
+        Some(pixels) => SlotRead::Ok(pixels),
+        None => SlotRead::Stale,
+    };
+    match from_ring {
+        SlotRead::Ok(pixels) => {
+            let differing = pixels
+                .iter()
+                .zip(&inline_frame.rgba8)
+                .filter(|(a, b)| a != b)
+                .count();
+            if differing > 0 {
+                let (w, h) = (width as usize, height as usize);
+                let (mut x0, mut y0, mut x1, mut y1) = (w, h, 0_usize, 0_usize);
+                for (index, (a, b)) in pixels
+                    .as_chunks::<4>()
+                    .0
+                    .iter()
+                    .zip(inline_frame.rgba8.as_chunks::<4>().0)
+                    .enumerate()
+                {
+                    if a != b {
+                        let (x, y) = (index % w, index / w);
+                        x0 = x0.min(x);
+                        y0 = y0.min(y);
+                        x1 = x1.max(x);
+                        y1 = y1.max(y);
+                    }
+                }
+                let later = wait_frame(&mut inline, WAIT, |f| {
+                    f.sequence > inline_frame.sequence + 10
+                })
+                .await;
+                let consecutive = later.map_or(usize::MAX, |later| {
+                    later
+                        .rgba8
+                        .iter()
+                        .zip(&inline_frame.rgba8)
+                        .filter(|(a, b)| a != b)
+                        .count()
+                });
+                println!(
+                    "  differing pixels span x {x0}..={x1}, y {y0}..={y1}; inline seq {} vs a later inline frame: {consecutive} bytes differ",
+                    inline_frame.sequence
+                );
+            }
+            checks.check(
+                "ring pixels are byte-identical to inline pixels",
+                pixels.len() == inline_frame.rgba8.len() && differing == 0,
+                format!(
+                    "ring seq {} vs inline seq {}, {} bytes, {differing} differ",
+                    ring_frame.sequence,
+                    inline_frame.sequence,
+                    pixels.len()
+                ),
+            );
+        }
+        SlotRead::Torn => checks.check(
+            "ring slot read is consistent",
+            false,
+            "torn on an idle read",
+        ),
+        SlotRead::Stale => checks.check(
+            "ring slot read is consistent",
+            false,
+            "slot no longer holds the frame",
+        ),
+    }
+
+    let (ok, torn, stale) =
+        stress_ring(&ring, width, height, StressTarget::Latest, STRESS_SECS).await;
+    println!(
+        "stress latest slot, {STRESS_SECS} s at {STRESS_FPS} fps: ok={ok} torn={torn} stale={stale}"
+    );
+    checks.check(
+        "latest-slot reads are never torn",
+        torn == 0,
+        format!("torn={torn} of {}", ok + torn + stale),
+    );
+    let (ok, torn, stale) =
+        stress_ring(&ring, width, height, StressTarget::Oldest, STRESS_SECS).await;
+    println!(
+        "stress oldest slot, {STRESS_SECS} s at {STRESS_FPS} fps: ok={ok} torn={torn} stale={stale} (torn/stale are detections, not failures)"
+    );
+    checks.check(
+        "stress ran and read frames",
+        ok + torn + stale > 0,
+        format!("ok={ok} torn={torn} stale={stale}"),
+    );
+
+    let passed = checks.failed == 0;
+    println!(
+        "RESULT: {} ({} of {} checks passed)",
+        if passed { "PASS" } else { "FAIL" },
+        checks.total - checks.failed,
+        checks.total
+    );
+    Ok(passed)
+}
+
+// ---- --bench: inline vs ring transport, with edit -> frame latency -----------
+
+/// Interval between edits in `--bench`.
+const BENCH_EDIT_INTERVAL: Duration = Duration::from_millis(250);
+
+/// Measured numbers for one transport.
+struct BenchResult {
+    transport: &'static str,
+    secs: f64,
+    frames: u64,
+    bytes: u64,
+    torn: u64,
+    latencies_ms: Vec<f64>,
+    edits_sent: u64,
+    engine_us_mean: f64,
+    readback_us_mean: f64,
+}
+
+/// Runs the bench for both transports, one after the other.
+async fn run_bench(secs: u64) -> Result<bool, Box<dyn Error>> {
+    let mut results = Vec::new();
+    for shared in [false, true] {
+        results.push(bench_once(shared, secs).await?);
+    }
+    println!();
+    println!(
+        "{:<8} {:>8} {:>9} {:>6} {:>10} {:>10} {:>7} {:>6} {:>10} {:>12}",
+        "transport",
+        "frames/s",
+        "MB/s",
+        "torn",
+        "lat mean",
+        "lat p95",
+        "lat n",
+        "edits",
+        "engine us",
+        "readback us"
+    );
+    for result in &results {
+        let mut sorted = result.latencies_ms.clone();
+        sorted.sort_by(f64::total_cmp);
+        let mean = if sorted.is_empty() {
+            f64::NAN
+        } else {
+            sorted.iter().sum::<f64>() / sorted.len() as f64
+        };
+        let p95 = if sorted.is_empty() {
+            f64::NAN
+        } else {
+            sorted[((sorted.len() as f64 * 0.95).ceil() as usize).clamp(1, sorted.len()) - 1]
+        };
+        println!(
+            "{:<8} {:>8.1} {:>9.1} {:>6} {:>8.1}ms {:>8.1}ms {:>7} {:>6} {:>10.0} {:>12.0}",
+            result.transport,
+            result.frames as f64 / result.secs,
+            result.bytes as f64 / result.secs / 1.0e6,
+            result.torn,
+            mean,
+            p95,
+            sorted.len(),
+            result.edits_sent,
+            result.engine_us_mean,
+            result.readback_us_mean
+        );
+    }
+    Ok(true)
+}
+
+/// One transport: LoadStage, a 250 ms edit loop, and `secs` seconds of frames.
+async fn bench_once(shared: bool, secs: u64) -> Result<BenchResult, Box<dyn Error>> {
+    let mut client = Client::connect(endpoint()).await?;
+    let hello = client
+        .hello(HelloRequest {
+            editor_version: "bridge_probe --bench".into(),
+        })
+        .await?
+        .into_inner();
+    let ring = RingView::open(&hello).ok();
+    if shared && ring.is_none() {
+        return Err("shared transport needs a frame ring".into());
+    }
+    client
+        .load_stage(LoadStageRequest {
+            entities: demo_scene(),
+        })
+        .await?;
+    let mut frames = client
+        .stream_frames(StreamFramesRequest {
+            max_fps: 120,
+            prefer_shared_memory: shared,
+            ..Default::default()
+        })
+        .await?
+        .into_inner();
+    wait_frame(&mut frames, WAIT, |f| !Stats::of(f).is_flat())
+        .await
+        .ok_or("scene never rendered")?;
+
+    // Edits every 250 ms, timestamped before the call (the ack waits for apply).
+    let sent: Arc<Mutex<BTreeMap<u64, Instant>>> = Arc::new(Mutex::new(BTreeMap::new()));
+    let edit_counter = Arc::new(AtomicU64::new(0));
+    let counter_for_task = Arc::clone(&edit_counter);
+    let edit_sent = Arc::clone(&sent);
+    let mut edit_client = client.clone();
+    let editor = tokio::spawn(async move {
+        let mut tick = tokio::time::interval(BENCH_EDIT_INTERVAL);
+        // Start from the wall clock: the engine keeps the highest id it has applied, so
+        // ids must keep increasing across bench runs against the same server.
+        let mut edit_id = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_micros() as u64);
+        loop {
+            tick.tick().await;
+            edit_id += 1;
+            counter_for_task.store(edit_id, Ordering::Relaxed);
+            let x = if edit_id.is_multiple_of(2) { 0.5 } else { -0.5 };
+            let at = Instant::now();
+            edit_sent
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .insert(edit_id, at);
+            let request = ApplyDeltaRequest {
+                deltas: vec![EntityDelta {
+                    path: "/Level/Crate".into(),
+                    local: Some(transform([x, 0.5, 0.0])),
+                    base_color: None,
+                    removed: false,
+                }],
+                edit_id,
+            };
+            if edit_client.apply_delta(request).await.is_err() {
+                break;
+            }
+        }
+        edit_id
+    });
+
+    let transport = if shared { "ring" } else { "inline" };
+    let started = Instant::now();
+    let deadline = started + Duration::from_secs(secs);
+    let (mut count, mut bytes, mut torn) = (0_u64, 0_u64, 0_u64);
+    let mut latencies_ms = Vec::new();
+    let (mut engine_sum, mut readback_sum) = (0_u64, 0_u64);
+    while Instant::now() < deadline {
+        let next = match tokio::time::timeout(Duration::from_secs(5), frames.next()).await {
+            Ok(Some(Ok(frame))) => frame,
+            _ => break,
+        };
+        let received = Instant::now();
+        let frame_bytes = if next.in_ring {
+            let Some(ring) = ring.as_ref() else { break };
+            match ring.read(next.sequence, next.width, next.height) {
+                SlotRead::Ok(pixels) => pixels.len() as u64,
+                SlotRead::Torn | SlotRead::Stale => {
+                    torn += 1;
+                    continue;
+                }
+            }
+        } else {
+            next.rgba8.len() as u64
+        };
+        count += 1;
+        bytes += frame_bytes;
+        engine_sum += u64::from(next.engine_frame_us);
+        readback_sum += u64::from(next.readback_us);
+        // Every edit applied at or before this frame's render has now been seen.
+        let mut pending = sent.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let seen: Vec<u64> = pending
+            .range(..=next.last_edit_id)
+            .map(|(id, _)| *id)
+            .collect();
+        for id in seen {
+            if let Some(at) = pending.remove(&id) {
+                latencies_ms.push(received.duration_since(at).as_secs_f64() * 1000.0);
+            }
+        }
+    }
+    let elapsed = started.elapsed().as_secs_f64();
+    editor.abort();
+    let edits_sent = edit_counter.load(Ordering::Relaxed);
+    let frames_done = count.max(1) as f64;
+    Ok(BenchResult {
+        transport,
+        secs: elapsed,
+        frames: count,
+        bytes,
+        torn,
+        latencies_ms,
+        edits_sent,
+        engine_us_mean: engine_sum as f64 / frames_done,
+        readback_us_mean: readback_sum as f64 / frames_done,
+    })
 }

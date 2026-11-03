@@ -16,12 +16,14 @@
 //! Loading a stage is logged by the bridge (`adv_bridge: loading stage`). If the gRPC
 //! port is already taken the app logs why and exits with a non-zero code.
 
+use std::time::Duration;
+
 use adv_bridge::AdvBridgePlugin;
 use bevy::{
     app::AppExit,
     prelude::*,
     window::{ExitCondition, WindowPlugin},
-    winit::WinitSettings,
+    winit::{UpdateMode, WinitSettings},
 };
 
 fn main() -> AppExit {
@@ -38,9 +40,14 @@ fn main() -> AppExit {
             close_when_requested: false,
             ..default()
         }))
-        // Explicit so the editor mode's loop rate does not depend on defaults:
-        // no focused window means the unfocused (60 Hz reactive) mode applies.
-        .insert_resource(WinitSettings::game())
+        // No window is ever focused, so winit uses the unfocused mode. Set it to
+        // 120 Hz so `StreamFrames.max_fps` up to 120 can be met (the frame rate is
+        // the engine loop rate). Idle CPU rises with the loop rate; measure it when
+        // changing this.
+        .insert_resource(WinitSettings {
+            focused_mode: UpdateMode::Continuous,
+            unfocused_mode: UpdateMode::reactive_low_power(Duration::from_secs_f64(1.0 / 120.0)),
+        })
         .add_plugins(AdvBridgePlugin { addr, ..defaults })
         .run()
 }

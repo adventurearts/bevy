@@ -6,25 +6,31 @@
 //! are drained in the main schedule, so the Bevy main thread never blocks on the
 //! network.
 //!
-//! The engine renders into an offscreen [`Image`] that is read back on the GPU
-//! every frame and published on the `StreamFrames` stream.
+//! The engine renders into an offscreen [`Image`] that is read back on the GPU once
+//! per frame. Each frame is written to a shared-memory ring ([`ring`]) and published
+//! to `StreamFrames` subscribers, who take either the ring slot or inline bytes.
 
+mod frame;
 mod input;
+mod readback;
+mod ring;
 mod scene;
 mod server;
 
-use std::{net::SocketAddr, sync::Arc, sync::Mutex, thread};
-
-use bevy::{
-    app::AppExit,
-    image::Image,
-    log::error,
-    prelude::*,
-    render::gpu_readback::{Readback, ReadbackComplete},
+use std::{
+    net::SocketAddr,
+    sync::{Arc, Mutex},
+    thread,
 };
+
+use bevy::{app::AppExit, log::error, prelude::*};
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::{broadcast, watch};
 use tokio_stream::wrappers::TcpListenerStream;
+
+use crate::readback::{
+    EditTracker, FrameChange, FrameSink, RequestCounter, RingInfo, RingWriter, SharedRing,
+};
 
 /// Engine events kept for slow `StreamEvents` subscribers before they start to lag.
 const EVENT_BUFFER: usize = 256;
@@ -44,6 +50,7 @@ pub(crate) enum Command {
     /// Applies edits to loaded entities. The reply is sent once they are applied.
     ApplyDelta {
         deltas: Vec<proto::EntityDelta>,
+        edit_id: u64,
         reply: Reply,
     },
     /// Resizes the offscreen target. The reply is sent once Bevy has applied it.
@@ -80,6 +87,9 @@ impl Default for AdvBridgePlugin {
 
 impl Plugin for AdvBridgePlugin {
     fn build(&self, app: &mut App) {
+        // Ring files of crashed earlier runs; a live run's ring is never touched.
+        ring::remove_stale_rings();
+
         let (command_tx, command_rx): (Sender<Command>, Receiver<Command>) =
             crossbeam_channel::unbounded();
         let (frame_tx, frame_rx) = watch::channel(None);
@@ -89,19 +99,20 @@ impl Plugin for AdvBridgePlugin {
 
         let (width, height) = self.viewport;
         let viewport = Arc::new(Mutex::new((width, height)));
+        let shared_ring = SharedRing(Arc::new(Mutex::new(RingInfo::default())));
         let state = server::ServerState {
             commands: command_tx,
             viewport: viewport.clone(),
             frames: frame_rx,
             inputs: input_tx,
             events: event_tx.clone(),
+            ring: shared_ring.0.clone(),
         };
 
         // Bind here, not on the server thread, so a port clash is known before the
         // app starts and can stop it (see `exit_if_bind_failed`).
         let addr = self.addr;
-        let listener = bind(addr);
-        match listener {
+        match bind(addr) {
             Ok(listener) => {
                 thread::Builder::new()
                     .name("adv_bridge-grpc".into())
@@ -140,10 +151,16 @@ impl Plugin for AdvBridgePlugin {
         }
 
         app.insert_resource(scene::BridgeCommands(command_rx))
-            .insert_resource(scene::FrameSink {
+            .insert_resource(FrameSink {
                 tx: frame_tx,
                 sequence: 0,
+                last_index: 0,
             })
+            .insert_resource(RingWriter::default())
+            .insert_resource(shared_ring)
+            .insert_resource(EditTracker::default())
+            .insert_resource(FrameChange::default())
+            .insert_resource(RequestCounter::default())
             .insert_resource(scene::ViewportTarget {
                 image: Handle::default(),
                 width,
@@ -156,6 +173,7 @@ impl Plugin for AdvBridgePlugin {
             .init_resource::<input::Interaction>()
             .insert_resource(ServerFatal(fatal_rx))
             .add_systems(Startup, (setup, exit_if_bind_failed))
+            .add_systems(First, readback::retire_readbacks)
             .add_systems(
                 Update,
                 (
@@ -165,6 +183,10 @@ impl Plugin for AdvBridgePlugin {
                     input::draw_selection,
                 )
                     .chain(),
+            )
+            .add_systems(
+                Last,
+                (readback::expire_requests, readback::spawn_readback).chain(),
             );
     }
 }
@@ -201,23 +223,15 @@ fn exit_on_server_failure(fatal: Res<ServerFatal>, mut exit: MessageWriter<AppEx
     }
 }
 
-/// Creates the offscreen target, the primitive meshes and the default camera
-/// and light, then starts the GPU readback of the target.
+/// Creates the offscreen target, the primitive meshes, the frame ring and the
+/// default camera and light.
 fn setup(world: &mut World) {
     let (width, height) = {
         let target = world.resource::<scene::ViewportTarget>();
         (target.width, target.height)
     };
-    // COPY_SRC is required for the GPU readback of the target.
-    let mut target = Image::new_target_texture(
-        width,
-        height,
-        bevy::render::render_resource::TextureFormat::Rgba8UnormSrgb,
-        None,
-    );
-    target.texture_descriptor.usage |= bevy::render::render_resource::TextureUsages::COPY_SRC;
-    let image = world.resource_mut::<Assets<Image>>().add(target);
-    world.resource_mut::<scene::ViewportTarget>().image = image.clone();
+    let image = readback::create_target(&mut world.resource_mut::<Assets<Image>>(), width, height);
+    world.resource_mut::<scene::ViewportTarget>().image = image;
 
     let primitives = scene::Primitives {
         cube: world.resource_mut::<Assets<Mesh>>().add(Cuboid::default()),
@@ -226,51 +240,15 @@ fn setup(world: &mut World) {
     };
     world.insert_resource(primitives);
 
-    world
-        .spawn((Name::new("adv_bridge/readback"), Readback::texture(image)))
-        .observe(on_frame_ready);
-
+    readback::create_initial_ring(world);
     scene::spawn_default_camera_and_light(world, true, true);
-}
 
-/// Publishes a completed GPU readback of the viewport to the frame stream.
-fn on_frame_ready(
-    readback: On<ReadbackComplete>,
-    mut sink: ResMut<scene::FrameSink>,
-    target: Res<scene::ViewportTarget>,
-) {
-    // A readback of the previous size (just after SetViewport) does not match the
-    // current target; it is dropped and the next readback is used instead.
-    let Some(rgba8) = unpadded_rgba8(&readback.data, target.width, target.height) else {
-        return;
-    };
-    sink.sequence += 1;
-    let frame = proto::Frame {
-        sequence: sink.sequence,
-        width: target.width,
-        height: target.height,
-        rgba8,
-    };
-    sink.tx.send_replace(Some(Arc::new(frame)));
-}
-
-/// wgpu copies rows with a stride rounded up to 256 bytes, and Bevy's readback
-/// returns those padded rows as-is. Strips the padding to tight RGBA8 rows.
-/// Returns `None` when `data` is not a padded `width` x `height` image.
-fn unpadded_rgba8(data: &[u8], width: u32, height: u32) -> Option<Vec<u8>> {
-    const COPY_ROW_ALIGNMENT: usize = 256;
-    let (width, height) = (width as usize, height as usize);
-    let row = width * 4;
-    let stride = row.div_ceil(COPY_ROW_ALIGNMENT) * COPY_ROW_ALIGNMENT;
-    if data.len() != stride * height {
-        return None;
-    }
-    if stride == row {
-        return Some(data.to_vec());
-    }
-    let mut tight = Vec::with_capacity(row * height);
-    for line in data.chunks_exact(stride) {
-        tight.extend_from_slice(&line[..row]);
-    }
-    Some(tight)
+    // Measure the per-frame hash cost once, so the number can be read from the log.
+    let sample = vec![0_u8; 960 * 540 * 4];
+    let started = std::time::Instant::now();
+    std::hint::black_box(frame::hash_pixels(std::hint::black_box(&sample)));
+    bevy::log::info!(
+        "adv_bridge: hashing one 960x540 frame takes {} us (skip_unchanged cost)",
+        started.elapsed().as_micros()
+    );
 }

@@ -10,20 +10,16 @@ use bevy::{
     prelude::*,
 };
 use crossbeam_channel::Receiver;
-use tokio::sync::watch;
 
-use crate::{proto, Command};
+use crate::{
+    proto,
+    readback::{fit_ring, EditTracker, FrameChange},
+    Command,
+};
 
 /// Receives commands from the gRPC thread. Drained once per frame.
 #[derive(Resource)]
 pub(crate) struct BridgeCommands(pub Receiver<Command>);
-
-/// Publishes rendered frames to the gRPC thread.
-#[derive(Resource)]
-pub(crate) struct FrameSink {
-    pub tx: watch::Sender<Option<std::sync::Arc<proto::Frame>>>,
-    pub sequence: u64,
-}
 
 /// Viewport size Bevy has actually applied; shared with the gRPC thread for `Hello`.
 #[derive(Resource)]
@@ -65,10 +61,18 @@ pub(crate) fn apply_commands(world: &mut World) {
         match command {
             Command::LoadStage { entities, reply } => {
                 load_stage(world, entities);
+                world.resource_mut::<FrameChange>().0 = true;
                 let _ = reply.send(Ok(()));
             }
-            Command::ApplyDelta { deltas, reply } => {
+            Command::ApplyDelta {
+                deltas,
+                edit_id,
+                reply,
+            } => {
                 apply_deltas(world, deltas);
+                let mut edits = world.resource_mut::<EditTracker>();
+                edits.highest_applied = edits.highest_applied.max(edit_id);
+                world.resource_mut::<FrameChange>().0 = true;
                 let _ = reply.send(Ok(()));
             }
             Command::SetViewport {
@@ -77,6 +81,8 @@ pub(crate) fn apply_commands(world: &mut World) {
                 reply,
             } => {
                 set_viewport(world, width, height);
+                fit_ring(world, width, height);
+                world.resource_mut::<FrameChange>().0 = true;
                 // Ignore a caller that has gone away.
                 let _ = reply.send(Ok(()));
             }

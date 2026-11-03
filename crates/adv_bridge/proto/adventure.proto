@@ -46,6 +46,11 @@ message HelloReply {
   string engine_version = 1;
   uint32 viewport_width = 2;
   uint32 viewport_height = 3;
+  // Shared-memory frame ring (see "Frame ring" below). Empty path = unavailable,
+  // the editor then uses inline frames (Frame.rgba8).
+  string frame_ring_path = 4;
+  uint32 frame_ring_slots = 5;
+  uint64 frame_ring_slot_bytes = 6; // payload capacity of one slot
 }
 
 // ---- Flat scene description -------------------------------------------------
@@ -96,6 +101,10 @@ message EntityDelta {
 }
 message ApplyDeltaRequest {
   repeated EntityDelta deltas = 1;
+  // Editor-chosen, increasing. The engine echoes the highest edit id that was
+  // applied BEFORE a frame was rendered in Frame.last_edit_id, so the editor can
+  // measure edit -> pixels latency exactly. 0 = not tracked.
+  uint64 edit_id = 2;
 }
 
 // ---- Viewport ---------------------------------------------------------------
@@ -106,14 +115,35 @@ message SetViewportRequest {
 }
 
 message StreamFramesRequest {
-  uint32 max_fps = 1; // 0 = engine default (30)
+  uint32 max_fps = 1;                 // 0 = engine default (30)
+  bool prefer_shared_memory = 2;      // true: pixels go through the frame ring
+  bool skip_unchanged = 3;            // true: do not send a frame identical to the last one
 }
 message Frame {
   uint64 sequence = 1;
   uint32 width = 2;
   uint32 height = 3;
-  bytes rgba8 = 4; // width * height * 4 bytes, top-left origin
+  bytes rgba8 = 4;                    // inline pixels: width * height * 4, top-left origin; EMPTY when in_ring
+  bool in_ring = 5;                   // pixels are in the frame ring slot (sequence % slot_count)
+  uint64 last_edit_id = 6;            // see ApplyDeltaRequest.edit_id
+  uint32 engine_frame_us = 7;         // engine main-loop frame time, microseconds
+  uint32 readback_us = 8;             // GPU readback + publish time for this frame, microseconds
 }
+
+// Frame ring (shared memory, little endian), a file mapped by both processes at
+// Hello.frame_ring_path (the engine creates it, the editor maps it read-only):
+//   file header (64 bytes):
+//     u32 magic = 0x52564441 ("ADVR"), u32 version = 1, u32 slot_count, u32 reserved,
+//     u64 slot_bytes (payload capacity per slot), u64 latest_sequence (last completed frame),
+//     then zero padding to 64 bytes
+//   slot i (i in 0..slot_count) at offset 64 + i * (32 + slot_bytes):
+//     u64 seq_begin, u64 seq_end, u32 width, u32 height, u64 reserved, then payload
+//     (width*height*4 bytes RGBA8, tight rows)
+// Seqlock protocol: the writer sets seq_begin = N, writes width/height/pixels, then sets
+// seq_end = N (release ordering). A reader that sees Frame.sequence = N reads slot N % slot_count,
+// copies/uploads the pixels, then re-reads the slot header: if seq_begin != N or seq_end != N the
+// slot was overwritten while reading and the frame is dropped. The ring is recreated (new path)
+// when the viewport size grows beyond slot_bytes; the editor must re-Hello after SetViewport.
 
 // ---- Input ------------------------------------------------------------------
 

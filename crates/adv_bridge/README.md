@@ -34,7 +34,7 @@ RPCs:
 | `LoadStage` | Despawns all bridged entities, spawns the flat list. Parents first, `ChildOf` links, `Name` = prim path, cube/sphere/plane meshes with `StandardMaterial`, point/directional lights, cameras. |
 | `ApplyDelta` | Updates transform and base color by path, or removes by path. Acked once applied. |
 | `SetViewport` | Resizes the offscreen target. `Ack` is returned after Bevy applies the size, so `Hello` and the next frames match it. Each side is 1..=8192. |
-| `StreamFrames` | Server-streams frames at `max_fps` (default 30, capped at 120). |
+| `StreamFrames` | Server-streams frames at `max_fps` (default 30, capped at 120). `prefer_shared_memory` sends `in_ring` frames (pixels in the ring file); `skip_unchanged` drops frames identical to the last one sent, except the first frame after a change. |
 | `SendInput` | Client stream of mouse events, applied in arrival order (see Viewport input). Keyboard and wheel are accepted and ignored (TODO). |
 | `StreamEvents` | Server stream of `PickResult` and `TransformChanged`. Each subscriber gets a broadcast copy; a slow subscriber lags on its own and never blocks Bevy. Log forwarding is TODO. |
 | `SetSelection` | Draws an outline around the entity at `path`. `""` clears. Unknown path returns `ok = false`. |
@@ -112,8 +112,38 @@ Notes:
 - Readback rows are padded to wgpu's 256-byte copy alignment; the engine strips the
   padding, so every `Frame` is tight `width * height * 4` RGBA8 at any width
   (for example 1116 or 801 px).
-- Readback runs every frame regardless of `max_fps`; `max_fps` only throttles
-  what is sent over gRPC.
+- One readback is requested per engine frame, so the frame rate is the engine loop
+  rate. The example runs the loop at 120 Hz, so `max_fps` up to 120 can be met.
+  `max_fps` only throttles what is sent. Each frame is requested exactly once: the
+  request entity is spawned in `Last` and its `Readback` is removed in the next frame's
+  `First`, before the copy is made.
+- `Frame.last_edit_id` is the highest `ApplyDeltaRequest.edit_id` applied before the
+  frame's readback was requested (in `Last`, after this frame's `Update`). It is exact
+  for that request, not an estimate. `engine_frame_us` is the main-loop frame time of
+  that same frame, and `readback_us` is the time from request to publish.
+- `after_change` is set on the first frame after any LoadStage, ApplyDelta or
+  SetViewport. `skip_unchanged` subscribers still receive that frame.
+
+## Shared-memory frame ring
+
+The engine writes each frame into a ring file in the OS temp dir (`Hello` returns
+its path, slot count and slot capacity). The file layout and seqlock protocol are in
+`proto/adventure.proto`; `src/ring.rs` is the writer.
+
+- Slot capacity is `width * height * 4` rounded up to 64 bytes, so slots stay 8-aligned.
+  Three slots by default.
+- A `SetViewport` that needs a larger slot recreates the ring under a new path
+  (`adv_bridge_ring_<pid>_<gen>.bin`). Re-`Hello` after `SetViewport`, as the proto says.
+- The ring file is removed on a clean exit. A crashed engine leaves its file behind;
+  the next startup removes files whose pid is no longer running.
+- `StreamFrames.prefer_shared_memory` sends `in_ring = true` with empty `rgba8`. The
+  reader takes slot `sequence % slot_count`. Readers must check `seq_begin` and `seq_end`
+  against `sequence` before and after the copy, and drop the frame on a mismatch.
+- `StreamFrames.skip_unchanged` compares a 64-bit hash of the pixels with the last frame
+  sent to that subscriber. The hash is FNV-1a over 8-byte words. It costs about 1.0 ms per
+  960x540 frame in the release build (the debug build is about 30x slower). The engine
+  logs the figure once at startup. The hash is computed only for subscribers that ask
+  for `skip_unchanged`.
 - Cameras from the stage all target the viewport image, but only the first one
   is active.
 
@@ -121,10 +151,13 @@ Notes:
 
 - `build.rs` compiles the proto with `protox` (pure Rust, no `protoc`) and
   generates code into `OUT_DIR` with `tonic-prost-build`.
-- `src/lib.rs` plugin, `proto` module, readback observer.
+- `src/lib.rs` plugin, `proto` module, startup and schedule wiring.
 - `src/server.rs` gRPC service (tokio side).
 - `src/scene.rs` Bevy side: command application, entity spawning, index.
 - `src/input.rs` viewport input: picking, drag, selection outline, event emit.
+- `src/readback.rs` one readback request per frame, edit and change metadata, publish.
+- `src/frame.rs` frame data, row unpadding, pixel hash.
+- `src/ring.rs` shared-memory frame ring writer (seqlock), stale-file cleanup.
 
 ## Running the example
 
@@ -149,6 +182,27 @@ cargo run -p adv_bridge --example bridge_probe -- --interact target/interact
 
 Other probe modes: `--load-select` (20 rounds of LoadStage then SetSelection with
 no pause), and `--resize WxH` (repeatable) with optional `--resize-before-load`.
+
+Transport modes (run them against a release build for meaningful numbers):
+
+- `--shm`: waits until the scene settles (two identical consecutive ring frames), then
+  checks that a ring frame is byte-identical to an inline frame of the same scene. It
+  then runs a 5 s, 60 fps torn-read stress on the newest slot (expect 0 torn) and on
+  the oldest slot (torn and stale counts show the detector working).
+- `--bench <secs>`: runs inline, then ring, with edits every 250 ms. It reports frames/s,
+  payload MB/s, dropped reads, and edit-to-frame latency (mean and p95), measured with
+  `edit_id` and `last_edit_id`. Engine frame and readback times come from the frames.
+
+Measured on the dev box (release build, default backend, windowless, 120 Hz loop,
+20 s per transport):
+
+| transport | frames/s | MB/s | dropped | latency mean | latency p95 | engine frame | readback |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| inline | 103.8 | 215 | 0 | 46.8 ms | 73.0 ms | 9.4 ms | 22.6 ms |
+| ring | 65.3 | 135 | 0 | 31.7 ms | 32.5 ms | 8.2 ms | 18.3 ms |
+
+The ring reader is slower on the client in this bench (see the open items in the
+crate notes), though it has lower latency and no gRPC payload.
 ```
 
 Check the work with `cargo check -p adv_bridge --examples`.

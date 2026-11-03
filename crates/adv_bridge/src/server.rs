@@ -19,12 +19,14 @@ use tonic::{transport::Server, Request, Response, Status, Streaming};
 use bevy::log::{info, warn};
 
 use crate::{
+    frame::{hash_pixels, FrameData, SharedFrame},
     proto::{
         bridge_server::{Bridge, BridgeServer},
-        Ack, EngineEvent, EntityDelta, FlatEntity, Frame, HelloReply, HelloRequest, InputEvent,
-        LoadStageRequest, SetSelectionRequest, SetViewportRequest, StreamEventsRequest,
+        Ack, ApplyDeltaRequest, EngineEvent, FlatEntity, Frame, HelloReply, HelloRequest,
+        InputEvent, LoadStageRequest, SetSelectionRequest, SetViewportRequest, StreamEventsRequest,
         StreamFramesRequest,
     },
+    readback::RingInfo,
     Command, Reply,
 };
 
@@ -42,11 +44,13 @@ pub(crate) struct ServerState {
     pub commands: Sender<Command>,
     /// Viewport size Bevy has applied (written by the Bevy side), reported by `Hello`.
     pub viewport: Arc<Mutex<(u32, u32)>>,
-    pub frames: watch::Receiver<Option<Arc<Frame>>>,
+    pub frames: watch::Receiver<Option<SharedFrame>>,
     /// Editor input, drained by the Bevy main loop every frame.
     pub inputs: Sender<InputEvent>,
     /// Engine events; each `StreamEvents` call subscribes to this.
     pub events: broadcast::Sender<EngineEvent>,
+    /// Frame ring location, written by the Bevy side and reported by `Hello`.
+    pub ring: Arc<Mutex<RingInfo>>,
 }
 
 /// Serves the `Bridge` service on `incoming` until the process exits.
@@ -97,6 +101,14 @@ impl BridgeService {
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
+
+    fn ring(&self) -> RingInfo {
+        self.state
+            .ring
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
 }
 
 fn ack_ok() -> Ack {
@@ -106,16 +118,39 @@ fn ack_ok() -> Ack {
     }
 }
 
+/// Converts a published frame to its wire form. With `in_ring` the pixels stay in
+/// the shared-memory slot (`sequence % slots`) and `rgba8` is left empty.
+fn to_proto(frame: &FrameData, in_ring: bool) -> Frame {
+    Frame {
+        sequence: frame.sequence,
+        width: frame.width,
+        height: frame.height,
+        rgba8: if in_ring {
+            Vec::new()
+        } else {
+            frame.rgba8.clone()
+        },
+        in_ring,
+        last_edit_id: frame.last_edit_id,
+        engine_frame_us: frame.engine_frame_us,
+        readback_us: frame.readback_us,
+    }
+}
+
 #[tonic::async_trait]
 impl Bridge for BridgeService {
     async fn hello(&self, request: Request<HelloRequest>) -> Result<Response<HelloReply>, Status> {
         let editor_version = request.into_inner().editor_version;
         info!("adv_bridge: editor connected (version {editor_version:?})");
         let (viewport_width, viewport_height) = self.viewport();
+        let ring = self.ring();
         Ok(Response::new(HelloReply {
             engine_version: concat!("adv_bridge ", env!("CARGO_PKG_VERSION")).to_owned(),
             viewport_width,
             viewport_height,
+            frame_ring_path: ring.path,
+            frame_ring_slots: ring.slots,
+            frame_ring_slot_bytes: ring.slot_bytes,
         }))
     }
 
@@ -130,11 +165,15 @@ impl Bridge for BridgeService {
 
     async fn apply_delta(
         &self,
-        request: Request<crate::proto::ApplyDeltaRequest>,
+        request: Request<ApplyDeltaRequest>,
     ) -> Result<Response<Ack>, Status> {
-        let deltas: Vec<EntityDelta> = request.into_inner().deltas;
-        self.submit(|reply| Command::ApplyDelta { deltas, reply })
-            .await
+        let ApplyDeltaRequest { deltas, edit_id } = request.into_inner();
+        self.submit(|reply| Command::ApplyDelta {
+            deltas,
+            edit_id,
+            reply,
+        })
+        .await
     }
 
     async fn set_viewport(
@@ -163,31 +202,54 @@ impl Bridge for BridgeService {
         &self,
         request: Request<StreamFramesRequest>,
     ) -> Result<Response<Self::StreamFramesStream>, Status> {
-        let max_fps = match request.into_inner().max_fps {
+        let StreamFramesRequest {
+            max_fps,
+            prefer_shared_memory,
+            skip_unchanged,
+        } = request.into_inner();
+        let max_fps = match max_fps {
             0 => DEFAULT_FPS,
             fps => fps.min(MAX_FPS),
         };
         let mut frames = self.state.frames.clone();
+        let ring = self.state.ring.clone();
         let (tx, rx) = mpsc::channel::<Result<Frame, Status>>(2);
 
-        // One task per subscriber: wait for the next tick, then send the latest
-        // frame if it is new. Slow clients therefore see fewer frames, not a backlog.
+        // One task per subscriber: wait for the next tick, then send the latest frame
+        // if it is new. Slow clients therefore see fewer frames, not a backlog.
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs_f64(1.0 / f64::from(max_fps)));
             tick.set_missed_tick_behavior(MissedTickBehavior::Skip);
             let mut last_sent = 0_u64;
+            let mut last_hash: Option<u64> = None;
             loop {
                 tick.tick().await;
                 if frames.changed().await.is_err() {
                     break; // engine side is gone
                 }
-                let latest = frames.borrow_and_update().clone();
-                let Some(frame) = latest else { continue };
+                let Some(frame) = frames.borrow_and_update().clone() else {
+                    continue;
+                };
                 if frame.sequence == last_sent {
                     continue;
                 }
                 last_sent = frame.sequence;
-                if tx.send(Ok((*frame).clone())).await.is_err() {
+                if skip_unchanged {
+                    // Identical to what this subscriber got last, and no change was
+                    // applied since: skip. A change always sends its first frame.
+                    let hash = hash_pixels(&frame.rgba8);
+                    if last_hash == Some(hash) && !frame.after_change {
+                        continue;
+                    }
+                    last_hash = Some(hash);
+                }
+                let ring_ready = !ring
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .path
+                    .is_empty();
+                let in_ring = prefer_shared_memory && ring_ready;
+                if tx.send(Ok(to_proto(&frame, in_ring))).await.is_err() {
                     break; // client hung up
                 }
             }
