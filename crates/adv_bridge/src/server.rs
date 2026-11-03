@@ -3,7 +3,6 @@
 //! read from a `watch` channel that the Bevy side publishes into.
 
 use std::{
-    net::SocketAddr,
     pin::Pin,
     sync::{Arc, Mutex},
     time::Duration,
@@ -11,25 +10,28 @@ use std::{
 
 use crossbeam_channel::Sender;
 use tokio::{
-    sync::{mpsc, watch},
+    sync::{broadcast, mpsc, oneshot, watch},
     time::MissedTickBehavior,
 };
-use tokio_stream::{Stream, wrappers::ReceiverStream};
-use tonic::{Request, Response, Status, Streaming, transport::Server};
+use tokio_stream::{wrappers::ReceiverStream, Stream};
+use tonic::{transport::Server, Request, Response, Status, Streaming};
 
-use bevy::log::info;
+use bevy::log::{info, warn};
 
 use crate::{
-    Command,
     proto::{
-        Ack, EngineEvent, EntityDelta, FlatEntity, Frame, HelloReply, HelloRequest, InputEvent,
-        LoadStageRequest, SetViewportRequest, StreamEventsRequest, StreamFramesRequest,
         bridge_server::{Bridge, BridgeServer},
+        Ack, EngineEvent, EntityDelta, FlatEntity, Frame, HelloReply, HelloRequest, InputEvent,
+        LoadStageRequest, SetSelectionRequest, SetViewportRequest, StreamEventsRequest,
+        StreamFramesRequest,
     },
+    Command, Reply,
 };
 
 /// Largest viewport edge accepted by `SetViewport`.
 const MAX_VIEWPORT_EDGE: u32 = 8192;
+/// How long a mutating RPC waits for Bevy to apply the command.
+const APPLY_TIMEOUT: Duration = Duration::from_secs(5);
 /// `StreamFrames` rate when the client asks for `max_fps = 0`.
 const DEFAULT_FPS: u32 = 30;
 /// Upper bound on the requested `StreamFrames` rate.
@@ -38,16 +40,23 @@ const MAX_FPS: u32 = 120;
 /// Everything the gRPC service shares with the rest of the plugin.
 pub(crate) struct ServerState {
     pub commands: Sender<Command>,
-    /// Viewport size as last requested by the editor, reported by `Hello`.
+    /// Viewport size Bevy has applied (written by the Bevy side), reported by `Hello`.
     pub viewport: Arc<Mutex<(u32, u32)>>,
     pub frames: watch::Receiver<Option<Arc<Frame>>>,
+    /// Editor input, drained by the Bevy main loop every frame.
+    pub inputs: Sender<InputEvent>,
+    /// Engine events; each `StreamEvents` call subscribes to this.
+    pub events: broadcast::Sender<EngineEvent>,
 }
 
-/// Serves the `Bridge` service on `addr` until the process exits.
-pub(crate) async fn serve(addr: SocketAddr, state: ServerState) -> Result<(), tonic::transport::Error> {
+/// Serves the `Bridge` service on `incoming` until the process exits.
+pub(crate) async fn serve<I>(incoming: I, state: ServerState) -> Result<(), tonic::transport::Error>
+where
+    I: Stream<Item = std::io::Result<tokio::net::TcpStream>> + Send,
+{
     Server::builder()
         .add_service(BridgeServer::new(BridgeService { state }))
-        .serve(addr)
+        .serve_with_incoming(incoming)
         .await
 }
 
@@ -56,14 +65,29 @@ struct BridgeService {
 }
 
 impl BridgeService {
-    /// Queues a command for the Bevy main thread and acknowledges acceptance.
-    /// The ack means "queued", not "applied".
-    fn enqueue(&self, command: Command) -> Result<Response<Ack>, Status> {
+    /// Queues a command for the Bevy main thread and waits until Bevy has applied
+    /// it, so a following RPC sees its effect. `build` receives the reply channel.
+    ///
+    /// On timeout the ack is `ok = false`, but the command stays queued and may
+    /// still be applied later; the editor should resync (LoadStage) if it cares.
+    async fn submit(&self, build: impl FnOnce(Reply) -> Command) -> Result<Response<Ack>, Status> {
+        let (reply, outcome) = oneshot::channel();
         self.state
             .commands
-            .send(command)
+            .send(build(reply))
             .map_err(|_| Status::unavailable("engine main loop is not running"))?;
-        Ok(Response::new(ack_ok()))
+        match tokio::time::timeout(APPLY_TIMEOUT, outcome).await {
+            Ok(Ok(Ok(()))) => Ok(Response::new(ack_ok())),
+            Ok(Ok(Err(message))) => Ok(Response::new(Ack { ok: false, message })),
+            Ok(Err(_)) => Err(Status::unavailable("engine dropped the request")),
+            Err(_) => Ok(Response::new(Ack {
+                ok: false,
+                message: format!(
+                    "timed out after {} s waiting for the engine to apply the command",
+                    APPLY_TIMEOUT.as_secs()
+                ),
+            })),
+        }
     }
 
     fn viewport(&self) -> (u32, u32) {
@@ -95,29 +119,42 @@ impl Bridge for BridgeService {
         }))
     }
 
-    async fn load_stage(&self, request: Request<LoadStageRequest>) -> Result<Response<Ack>, Status> {
+    async fn load_stage(
+        &self,
+        request: Request<LoadStageRequest>,
+    ) -> Result<Response<Ack>, Status> {
         let entities: Vec<FlatEntity> = request.into_inner().entities;
-        self.enqueue(Command::LoadStage(entities))
+        self.submit(|reply| Command::LoadStage { entities, reply })
+            .await
     }
 
-    async fn apply_delta(&self, request: Request<crate::proto::ApplyDeltaRequest>) -> Result<Response<Ack>, Status> {
+    async fn apply_delta(
+        &self,
+        request: Request<crate::proto::ApplyDeltaRequest>,
+    ) -> Result<Response<Ack>, Status> {
         let deltas: Vec<EntityDelta> = request.into_inner().deltas;
-        self.enqueue(Command::ApplyDelta(deltas))
+        self.submit(|reply| Command::ApplyDelta { deltas, reply })
+            .await
     }
 
-    async fn set_viewport(&self, request: Request<SetViewportRequest>) -> Result<Response<Ack>, Status> {
+    async fn set_viewport(
+        &self,
+        request: Request<SetViewportRequest>,
+    ) -> Result<Response<Ack>, Status> {
         let SetViewportRequest { width, height } = request.into_inner();
         if !(1..=MAX_VIEWPORT_EDGE).contains(&width) || !(1..=MAX_VIEWPORT_EDGE).contains(&height) {
             return Err(Status::invalid_argument(format!(
                 "viewport must be 1..={MAX_VIEWPORT_EDGE} pixels per side, got {width}x{height}"
             )));
         }
-        *self
-            .state
-            .viewport
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner()) = (width, height);
-        self.enqueue(Command::SetViewport { width, height })
+        // Waits until Bevy has applied the resize, so `Ack.ok` and `Hello` agree with
+        // the frames that follow.
+        self.submit(|reply| Command::SetViewport {
+            width,
+            height,
+            reply,
+        })
+        .await
     }
 
     type StreamFramesStream = Pin<Box<dyn Stream<Item = Result<Frame, Status>> + Send + 'static>>;
@@ -160,23 +197,58 @@ impl Bridge for BridgeService {
         Ok(Response::new(stream))
     }
 
-    async fn send_input(&self, request: Request<Streaming<InputEvent>>) -> Result<Response<Ack>, Status> {
-        // TODO(phase 2): forward mouse/keyboard events to the engine input systems.
+    async fn set_selection(
+        &self,
+        request: Request<SetSelectionRequest>,
+    ) -> Result<Response<Ack>, Status> {
+        let path = request.into_inner().path;
+        self.submit(|reply| Command::SetSelection { path, reply })
+            .await
+    }
+
+    async fn send_input(
+        &self,
+        request: Request<Streaming<InputEvent>>,
+    ) -> Result<Response<Ack>, Status> {
+        // Unbounded: the Bevy loop drains it every frame, so backlog stays small.
         let mut inbound = request.into_inner();
-        while inbound.message().await?.is_some() {}
+        while let Some(event) = inbound.message().await? {
+            if self.state.inputs.send(event).is_err() {
+                return Err(Status::unavailable("engine main loop is not running"));
+            }
+        }
         Ok(Response::new(ack_ok()))
     }
 
-    type StreamEventsStream = Pin<Box<dyn Stream<Item = Result<EngineEvent, Status>> + Send + 'static>>;
+    type StreamEventsStream =
+        Pin<Box<dyn Stream<Item = Result<EngineEvent, Status>> + Send + 'static>>;
 
     async fn stream_events(
         &self,
         _request: Request<StreamEventsRequest>,
     ) -> Result<Response<Self::StreamEventsStream>, Status> {
-        // TODO(phase 2): forward engine logs, selection and play state. For now the
-        // stream is held open and never yields; the sender lives until the client leaves.
-        let (tx, rx) = mpsc::channel::<Result<EngineEvent, Status>>(1);
-        tokio::spawn(async move { tx.closed().await });
+        // Each subscriber gets its own task and bounded channel, so a slow client only
+        // lags itself; Bevy never waits on it. Logs are not forwarded yet (TODO).
+        let mut events = self.state.events.subscribe();
+        let (tx, rx) = mpsc::channel::<Result<EngineEvent, Status>>(64);
+        tokio::spawn(async move {
+            loop {
+                tokio::select! {
+                    _ = tx.closed() => break,
+                    received = events.recv() => match received {
+                        Ok(event) => {
+                            if tx.send(Ok(event)).await.is_err() {
+                                break;
+                            }
+                        }
+                        Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                            warn!("adv_bridge: a StreamEvents subscriber skipped {skipped} events");
+                        }
+                        Err(broadcast::error::RecvError::Closed) => break,
+                    },
+                }
+            }
+        });
         let stream: Self::StreamEventsStream = Box::pin(ReceiverStream::new(rx));
         Ok(Response::new(stream))
     }

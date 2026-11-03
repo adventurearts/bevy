@@ -12,7 +12,7 @@ use bevy::{
 use crossbeam_channel::Receiver;
 use tokio::sync::watch;
 
-use crate::{Command, proto};
+use crate::{proto, Command};
 
 /// Receives commands from the gRPC thread. Drained once per frame.
 #[derive(Resource)]
@@ -24,6 +24,10 @@ pub(crate) struct FrameSink {
     pub tx: watch::Sender<Option<std::sync::Arc<proto::Frame>>>,
     pub sequence: u64,
 }
+
+/// Viewport size Bevy has actually applied; shared with the gRPC thread for `Hello`.
+#[derive(Resource)]
+pub(crate) struct AppliedViewport(pub std::sync::Arc<std::sync::Mutex<(u32, u32)>>);
 
 /// The offscreen render target the bridge camera draws into.
 #[derive(Resource)]
@@ -49,15 +53,36 @@ pub(crate) struct Primitives {
 #[derive(Component)]
 pub(crate) struct Bridged;
 
+/// Primitive shape used for picking and the selection outline. Lights and cameras have none.
+#[derive(Component, Clone, Copy)]
+pub(crate) struct PickShape(pub proto::PrimitiveKind);
+
 /// Drains pending commands in arrival order. Exclusive because loading a stage
 /// needs `World` access to spawn entities and mutate assets.
 pub(crate) fn apply_commands(world: &mut World) {
     let pending: Vec<Command> = world.resource::<BridgeCommands>().0.try_iter().collect();
     for command in pending {
         match command {
-            Command::LoadStage(entities) => load_stage(world, entities),
-            Command::ApplyDelta(deltas) => apply_deltas(world, deltas),
-            Command::SetViewport { width, height } => set_viewport(world, width, height),
+            Command::LoadStage { entities, reply } => {
+                load_stage(world, entities);
+                let _ = reply.send(Ok(()));
+            }
+            Command::ApplyDelta { deltas, reply } => {
+                apply_deltas(world, deltas);
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetViewport {
+                width,
+                height,
+                reply,
+            } => {
+                set_viewport(world, width, height);
+                // Ignore a caller that has gone away.
+                let _ = reply.send(Ok(()));
+            }
+            Command::SetSelection { path, reply } => {
+                crate::input::set_selection(world, path, reply)
+            }
         }
     }
 }
@@ -65,6 +90,7 @@ pub(crate) fn apply_commands(world: &mut World) {
 /// Replaces every bridged entity with `entities`. Parents are spawned before
 /// their children so `ChildOf` can point at a live entity.
 fn load_stage(world: &mut World, entities: Vec<proto::FlatEntity>) {
+    crate::input::cancel_drag(world);
     despawn_bridged(world);
     info!("adv_bridge: loading stage with {} entities", entities.len());
 
@@ -88,11 +114,17 @@ fn load_stage(world: &mut World, entities: Vec<proto::FlatEntity>) {
                     continue;
                 }
                 ParentLookup::NotYet => {
-                    warn!("adv_bridge: {} has an unresolvable parent, attaching to root", entity.path);
+                    warn!(
+                        "adv_bridge: {} has an unresolvable parent, attaching to root",
+                        entity.path
+                    );
                     None
                 }
                 ParentLookup::Missing => {
-                    warn!("adv_bridge: {} names missing parent {:?}", entity.path, entity.parent_path);
+                    warn!(
+                        "adv_bridge: {} names missing parent {:?}",
+                        entity.path, entity.parent_path
+                    );
                     None
                 }
             };
@@ -108,7 +140,12 @@ fn load_stage(world: &mut World, entities: Vec<proto::FlatEntity>) {
             }
             // A duplicate path keeps the old entity alive (it is still bridged) but
             // deltas will address the newer one.
-            if world.resource_mut::<EntityIndex>().0.insert(entity.path.clone(), id).is_some() {
+            if world
+                .resource_mut::<EntityIndex>()
+                .0
+                .insert(entity.path.clone(), id)
+                .is_some()
+            {
                 warn!("adv_bridge: duplicate prim path {}", entity.path);
             }
             spawned_any = true;
@@ -138,7 +175,11 @@ enum ParentLookup {
     Missing,
 }
 
-fn parent_of(entity: &proto::FlatEntity, world: &World, all_paths: &HashSet<String>) -> ParentLookup {
+fn parent_of(
+    entity: &proto::FlatEntity,
+    world: &World,
+    all_paths: &HashSet<String>,
+) -> ParentLookup {
     if entity.parent_path.is_empty() {
         return ParentLookup::Root;
     }
@@ -172,15 +213,22 @@ fn spawn_entity(world: &mut World, entity: &proto::FlatEntity, parent: Option<En
     let primitive = proto::PrimitiveKind::try_from(entity.primitive).unwrap_or_default();
     let mesh = match primitive {
         proto::PrimitiveKind::PrimitiveCube => Some(world.resource::<Primitives>().cube.clone()),
-        proto::PrimitiveKind::PrimitiveSphere => Some(world.resource::<Primitives>().sphere.clone()),
+        proto::PrimitiveKind::PrimitiveSphere => {
+            Some(world.resource::<Primitives>().sphere.clone())
+        }
         proto::PrimitiveKind::PrimitivePlane => Some(world.resource::<Primitives>().plane.clone()),
         proto::PrimitiveKind::PrimitiveNone => None,
     };
+    if primitive != proto::PrimitiveKind::PrimitiveNone {
+        world.entity_mut(id).insert(PickShape(primitive));
+    }
     if let Some(mesh) = mesh {
-        let material = world.resource_mut::<Assets<StandardMaterial>>().add(StandardMaterial {
-            base_color: to_color(entity.base_color.as_ref()),
-            ..default()
-        });
+        let material = world
+            .resource_mut::<Assets<StandardMaterial>>()
+            .add(StandardMaterial {
+                base_color: to_color(entity.base_color.as_ref()),
+                ..default()
+            });
         world
             .entity_mut(id)
             .insert((Mesh3d(mesh), MeshMaterial3d(material)));
@@ -210,6 +258,7 @@ fn spawn_entity(world: &mut World, entity: &proto::FlatEntity, parent: Option<En
 
 fn apply_deltas(world: &mut World, deltas: Vec<proto::EntityDelta>) {
     for delta in deltas {
+        crate::input::cancel_drag_if_path(world, &delta.path);
         let Some(entity) = world.resource::<EntityIndex>().0.get(&delta.path).copied() else {
             warn!("adv_bridge: delta for unknown path {}", delta.path);
             continue;
@@ -234,22 +283,21 @@ fn apply_deltas(world: &mut World, deltas: Vec<proto::EntityDelta>) {
             continue;
         }
 
-        if let Some(local) = &delta.local {
-            if let Some(mut transform) = world.get_mut::<Transform>(entity) {
-                *transform = to_transform(Some(local));
-            }
+        if let Some(local) = &delta.local
+            && let Some(mut transform) = world.get_mut::<Transform>(entity)
+        {
+            *transform = to_transform(Some(local));
         }
         if let Some(color) = &delta.base_color {
             let material = world
                 .get::<MeshMaterial3d<StandardMaterial>>(entity)
                 .map(|material| material.0.clone());
-            if let Some(material) = material {
-                if let Some(mut standard) = world
+            if let Some(material) = material
+                && let Some(mut standard) = world
                     .resource_mut::<Assets<StandardMaterial>>()
                     .get_mut(&material)
-                {
-                    standard.base_color = to_color(Some(color));
-                }
+            {
+                standard.base_color = to_color(Some(color));
             }
         }
     }
@@ -267,6 +315,12 @@ fn set_viewport(world: &mut World, width: u32, height: u32) {
     let mut viewport = world.resource_mut::<ViewportTarget>();
     viewport.width = width;
     viewport.height = height;
+    // Publish the size actually applied, so Hello reports what frames will look like.
+    *world
+        .resource::<AppliedViewport>()
+        .0
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = (width, height);
     // Readbacks of the old size are dropped by the size check in `on_frame_ready`.
 }
 

@@ -26,8 +26,12 @@ service Bridge {
   // Editor -> engine. Mouse/keyboard captured over the viewport.
   rpc SendInput(stream InputEvent) returns (Ack);
 
-  // Engine -> editor. Logs, selection, play state.
+  // Engine -> editor. Logs, picking, edits made inside the viewport.
   rpc StreamEvents(StreamEventsRequest) returns (stream EngineEvent);
+
+  // Editor -> engine. The editor's current selection; the engine draws an
+  // outline around it. "" clears the selection.
+  rpc SetSelection(SetSelectionRequest) returns (Ack);
 }
 
 message Ack {
@@ -133,7 +137,18 @@ message EngineEvent {
   oneof kind {
     LogLine log = 1;
     PickResult picked = 2;
+    TransformChanged transform_changed = 3;
   }
 }
 message LogLine { string level = 1; string text = 2; }
 message PickResult { string path = 1; }  // "" when nothing under the cursor
+
+// The user moved an entity directly in the viewport (drag). The editor writes
+// this into its USD stage as an opinion and must NOT echo it back as ApplyDelta.
+message TransformChanged {
+  string path = 1;
+  Transform local = 2;   // new local transform relative to the parent
+  bool final = 3;        // false while dragging (throttled), true on release
+}
+
+message SetSelectionRequest { string path = 1; }
