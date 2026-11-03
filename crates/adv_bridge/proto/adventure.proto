@@ -1,0 +1,139 @@
+// Adventure editor <-> engine contract (PROTOTYPE, v1).
+//
+// The editor owns the USD stage and resolves composition. The engine only ever
+// sees flat, already-resolved entities addressed by prim path.
+syntax = "proto3";
+
+package adventure.v1;
+
+service Bridge {
+  // Handshake. Engine reports its version and the viewport size it renders at.
+  rpc Hello(HelloRequest) returns (HelloReply);
+
+  // Replace everything in the engine world with this flat entity list.
+  rpc LoadStage(LoadStageRequest) returns (Ack);
+
+  // Apply small edits to already-loaded entities (keyed by prim path).
+  rpc ApplyDelta(ApplyDeltaRequest) returns (Ack);
+
+  // Ask the engine to (re)size its offscreen viewport target.
+  rpc SetViewport(SetViewportRequest) returns (Ack);
+
+  // Engine -> editor. Rendered viewport frames (raw RGBA8, CPU path for now;
+  // a shared-GPU-texture path can replace this behind the same RPC later).
+  rpc StreamFrames(StreamFramesRequest) returns (stream Frame);
+
+  // Editor -> engine. Mouse/keyboard captured over the viewport.
+  rpc SendInput(stream InputEvent) returns (Ack);
+
+  // Engine -> editor. Logs, selection, play state.
+  rpc StreamEvents(StreamEventsRequest) returns (stream EngineEvent);
+}
+
+message Ack {
+  bool ok = 1;
+  string message = 2; // error text when ok == false
+}
+
+message HelloRequest {
+  string editor_version = 1;
+}
+message HelloReply {
+  string engine_version = 1;
+  uint32 viewport_width = 2;
+  uint32 viewport_height = 3;
+}
+
+// ---- Flat scene description -------------------------------------------------
+
+message Vec3 { float x = 1; float y = 2; float z = 3; }
+message Quat { float x = 1; float y = 2; float z = 3; float w = 4; }
+message Color { float r = 1; float g = 2; float b = 3; float a = 4; }
+
+message Transform {
+  Vec3 translation = 1;
+  Quat rotation = 2;
+  Vec3 scale = 3;
+}
+
+enum PrimitiveKind {
+  PRIMITIVE_NONE = 0;
+  PRIMITIVE_CUBE = 1;
+  PRIMITIVE_SPHERE = 2;
+  PRIMITIVE_PLANE = 3;
+}
+
+enum LightKind {
+  LIGHT_NONE = 0;
+  LIGHT_DIRECTIONAL = 1;
+  LIGHT_POINT = 2;
+}
+
+message FlatEntity {
+  string path = 1;          // unique, e.g. "/Level/Door"
+  string parent_path = 2;   // "" for roots
+  string type_name = 3;     // USD prim type, e.g. "Xform", "Cube", "Camera"
+  Transform local = 4;      // local transform relative to parent
+  PrimitiveKind primitive = 5;
+  Color base_color = 6;
+  LightKind light = 7;
+  bool is_camera = 8;
+}
+
+message LoadStageRequest {
+  repeated FlatEntity entities = 1;
+}
+
+message EntityDelta {
+  string path = 1;
+  optional Transform local = 2;
+  optional Color base_color = 3;
+  bool removed = 4;
+}
+message ApplyDeltaRequest {
+  repeated EntityDelta deltas = 1;
+}
+
+// ---- Viewport ---------------------------------------------------------------
+
+message SetViewportRequest {
+  uint32 width = 1;
+  uint32 height = 2;
+}
+
+message StreamFramesRequest {
+  uint32 max_fps = 1; // 0 = engine default (30)
+}
+message Frame {
+  uint64 sequence = 1;
+  uint32 width = 2;
+  uint32 height = 3;
+  bytes rgba8 = 4; // width * height * 4 bytes, top-left origin
+}
+
+// ---- Input ------------------------------------------------------------------
+
+message InputEvent {
+  oneof kind {
+    MouseMove mouse_move = 1;
+    MouseButton mouse_button = 2;
+    MouseWheel mouse_wheel = 3;
+    Key key = 4;
+  }
+}
+message MouseMove { float x = 1; float y = 2; }          // viewport pixels
+message MouseButton { uint32 button = 1; bool pressed = 2; float x = 3; float y = 4; }
+message MouseWheel { float dx = 1; float dy = 2; }
+message Key { string code = 1; bool pressed = 2; }       // Bevy KeyCode debug name
+
+// ---- Events -----------------------------------------------------------------
+
+message StreamEventsRequest {}
+message EngineEvent {
+  oneof kind {
+    LogLine log = 1;
+    PickResult picked = 2;
+  }
+}
+message LogLine { string level = 1; string text = 2; }
+message PickResult { string path = 1; }  // "" when nothing under the cursor
